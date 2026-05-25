@@ -12,11 +12,15 @@ import android.graphics.Bitmap
 import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
+import android.media.Image
 import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
+import android.os.Handler
+import android.os.HandlerThread
 import android.os.IBinder
+import android.os.Looper
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -166,68 +170,113 @@ class ScreenCaptureService : Service() {
             mediaProjection
         } ?: return@withContext null
 
-        // Screen parameters setup
         val displayMetrics = resources.displayMetrics
         val width = displayMetrics.widthPixels
         val height = displayMetrics.heightPixels
         val density = displayMetrics.densityDpi
 
-        // Acquire 1 frame container
         val imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
-        
+        val deferredBitmap = CompletableDeferred<Bitmap?>()
+
+        val listener = ImageReader.OnImageAvailableListener { reader ->
+            try {
+                val image = reader.acquireLatestImage() ?: reader.acquireNextImage()
+                if (image != null) {
+                    val planes = image.planes
+                    val buffer = planes[0].buffer
+                    val pixelStride = planes[0].pixelStride
+                    val rowStride = planes[0].rowStride
+                    val rowPadding = rowStride - pixelStride * width
+
+                    val tempBitmap = Bitmap.createBitmap(
+                        width + rowPadding / pixelStride,
+                        height,
+                        Bitmap.Config.ARGB_8888
+                    )
+                    tempBitmap.copyPixelsFromBuffer(buffer)
+                    image.close()
+
+                    val croppedBitmap = if (rowPadding != 0) {
+                        Bitmap.createBitmap(tempBitmap, 0, 0, width, height)
+                    } else {
+                        tempBitmap
+                    }
+                    deferredBitmap.complete(croppedBitmap)
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                deferredBitmap.complete(null)
+            }
+        }
+
+        val handlerThread = HandlerThread("ScreenCaptureThread")
+        handlerThread.start()
+        val handler = Handler(handlerThread.looper)
+
+        imageReader.setOnImageAvailableListener(listener, handler)
+
         val virtualDisplay = try {
             activeProjection.createVirtualDisplay(
                 "ScreenCapture",
                 width, height, density,
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                imageReader.surface, null, null
+                imageReader.surface, null, handler
             )
         } catch (e: Exception) {
+            e.printStackTrace()
             activeProjection.stop()
             imageReader.close()
+            handlerThread.quit()
             return@withContext null
         }
 
-        // Delay briefly to allow frame content pipeline to settle
-        delay(200)
-
-        var bitmap: Bitmap? = null
-        try {
-            val image = imageReader.acquireLatestImage() ?: imageReader.acquireNextImage()
-            if (image != null) {
-                val planes = image.planes
-                val buffer = planes[0].buffer
-                val pixelStride = planes[0].pixelStride
-                val rowStride = planes[0].rowStride
-                val rowPadding = rowStride - pixelStride * width
-
-                // Form full dimension bitmap capturing padding configuration
-                val tempBitmap = Bitmap.createBitmap(
-                    width + rowPadding / pixelStride,
-                    height,
-                    Bitmap.Config.ARGB_8888
-                )
-                tempBitmap.copyPixelsFromBuffer(buffer)
-                image.close()
-
-                // Crop out any column row padding to match actual screen resolution
-                bitmap = if (rowPadding != 0) {
-                    Bitmap.createBitmap(tempBitmap, 0, 0, width, height)
-                } else {
-                    tempBitmap
-                }
+        val resultBitmap = try {
+            withTimeout(3000) {
+                deferredBitmap.await()
             }
         } catch (e: Exception) {
             e.printStackTrace()
+            try {
+                val image = imageReader.acquireLatestImage() ?: imageReader.acquireNextImage()
+                if (image != null) {
+                    val planes = image.planes
+                    val buffer = planes[0].buffer
+                    val pixelStride = planes[0].pixelStride
+                    val rowStride = planes[0].rowStride
+                    val rowPadding = rowStride - pixelStride * width
+
+                    val tempBitmap = Bitmap.createBitmap(
+                        width + rowPadding / pixelStride,
+                        height,
+                        Bitmap.Config.ARGB_8888
+                    )
+                    tempBitmap.copyPixelsFromBuffer(buffer)
+                    image.close()
+
+                    if (rowPadding != 0) {
+                        Bitmap.createBitmap(tempBitmap, 0, 0, width, height)
+                    } else {
+                        tempBitmap
+                    }
+                } else {
+                    null
+                }
+            } catch (ex: Exception) {
+                ex.printStackTrace()
+                null
+            }
         } finally {
             try {
+                imageReader.setOnImageAvailableListener(null, null)
                 virtualDisplay?.release()
                 imageReader.close()
+                handlerThread.quit()
             } catch (ex: Exception) {
                 ex.printStackTrace()
             }
         }
-        bitmap
+
+        resultBitmap
     }
 
     private fun createNotificationChannel() {
