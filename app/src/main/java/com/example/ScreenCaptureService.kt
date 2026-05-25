@@ -45,6 +45,10 @@ class ScreenCaptureService : Service() {
     private lateinit var overlayManager: OverlayManager
     private var isProcessingTranslation = false
     private var mediaProjection: MediaProjection? = null
+    private var imageReader: ImageReader? = null
+    private var virtualDisplay: VirtualDisplay? = null
+    private var backgroundThread: HandlerThread? = null
+    private var backgroundHandler: Handler? = null
 
     companion object {
         private const val CHANNEL_ID = "screen_capture_channel_id"
@@ -155,32 +159,79 @@ class ScreenCaptureService : Service() {
      * Grabs a high-fidelity image frame from the MediaProjection.
      */
     private suspend fun captureScreen(): Bitmap? = withContext(Dispatchers.Default) {
-        val activeProjection = synchronized(this@ScreenCaptureService) {
-            if (mediaProjection == null) {
+        val reader = synchronized(this@ScreenCaptureService) {
+            if (mediaProjection == null || imageReader == null || virtualDisplay == null) {
                 val resultCode = MediaProjectionHolder.resultCode
                 val data = MediaProjectionHolder.data ?: return@withContext null
                 val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-                mediaProjection = try {
+                
+                val mp = try {
                     projectionManager.getMediaProjection(resultCode, data)
                 } catch (e: Exception) {
                     e.printStackTrace()
                     null
+                } ?: return@withContext null
+                
+                mediaProjection = mp
+                
+                val displayMetrics = resources.displayMetrics
+                val width = displayMetrics.widthPixels
+                val height = displayMetrics.heightPixels
+                val density = displayMetrics.densityDpi
+                
+                val ir = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
+                imageReader = ir
+                
+                val thread = HandlerThread("ScreenCaptureThread")
+                thread.start()
+                backgroundThread = thread
+                val handler = Handler(thread.looper)
+                backgroundHandler = handler
+                
+                val vd = try {
+                    mp.createVirtualDisplay(
+                        "ScreenCapture",
+                        width, height, density,
+                        DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                        ir.surface, null, handler
+                    )
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                    mp.stop()
+                    ir.close()
+                    thread.quit()
+                    mediaProjection = null
+                    imageReader = null
+                    backgroundThread = null
+                    backgroundHandler = null
+                    return@withContext null
                 }
+                virtualDisplay = vd
             }
-            mediaProjection
+            imageReader
         } ?: return@withContext null
 
         val displayMetrics = resources.displayMetrics
         val width = displayMetrics.widthPixels
         val height = displayMetrics.heightPixels
-        val density = displayMetrics.densityDpi
 
-        val imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
+        // Drain any stale images left in the buffer queue
+        try {
+            var staleImage: Image?
+            while (true) {
+                staleImage = reader.acquireLatestImage() ?: reader.acquireNextImage()
+                if (staleImage == null) break
+                staleImage.close()
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+
         val deferredBitmap = CompletableDeferred<Bitmap?>()
 
-        val listener = ImageReader.OnImageAvailableListener { reader ->
+        val listener = ImageReader.OnImageAvailableListener { r ->
             try {
-                val image = reader.acquireLatestImage() ?: reader.acquireNextImage()
+                val image = r.acquireLatestImage() ?: r.acquireNextImage()
                 if (image != null) {
                     val planes = image.planes
                     val buffer = planes[0].buffer
@@ -209,35 +260,17 @@ class ScreenCaptureService : Service() {
             }
         }
 
-        val handlerThread = HandlerThread("ScreenCaptureThread")
-        handlerThread.start()
-        val handler = Handler(handlerThread.looper)
-
-        imageReader.setOnImageAvailableListener(listener, handler)
-
-        val virtualDisplay = try {
-            activeProjection.createVirtualDisplay(
-                "ScreenCapture",
-                width, height, density,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                imageReader.surface, null, handler
-            )
-        } catch (e: Exception) {
-            e.printStackTrace()
-            activeProjection.stop()
-            imageReader.close()
-            handlerThread.quit()
-            return@withContext null
-        }
+        val handler = backgroundHandler ?: return@withContext null
+        reader.setOnImageAvailableListener(listener, handler)
 
         val resultBitmap = try {
-            withTimeout(3000) {
+            withTimeout(1500) {
                 deferredBitmap.await()
             }
         } catch (e: Exception) {
             e.printStackTrace()
             try {
-                val image = imageReader.acquireLatestImage() ?: imageReader.acquireNextImage()
+                val image = reader.acquireLatestImage() ?: reader.acquireNextImage()
                 if (image != null) {
                     val planes = image.planes
                     val buffer = planes[0].buffer
@@ -267,10 +300,7 @@ class ScreenCaptureService : Service() {
             }
         } finally {
             try {
-                imageReader.setOnImageAvailableListener(null, null)
-                virtualDisplay?.release()
-                imageReader.close()
-                handlerThread.quit()
+                reader.setOnImageAvailableListener(null, null)
             } catch (ex: Exception) {
                 ex.printStackTrace()
             }
@@ -317,6 +347,28 @@ class ScreenCaptureService : Service() {
         ServiceStatus.isRunning.value = false
         serviceScope.cancel()
         synchronized(this) {
+            try {
+                virtualDisplay?.release()
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+            virtualDisplay = null
+
+            try {
+                imageReader?.close()
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+            imageReader = null
+
+            try {
+                backgroundThread?.quit()
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+            backgroundThread = null
+            backgroundHandler = null
+
             try {
                 mediaProjection?.stop()
             } catch (e: Exception) {
