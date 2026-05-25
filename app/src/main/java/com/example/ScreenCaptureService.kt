@@ -53,6 +53,15 @@ class ScreenCaptureService : Service() {
     @Volatile
     private var pendingDeferredBitmap: CompletableDeferred<Bitmap?>? = null
 
+    private val projectionCallback = object : MediaProjection.Callback() {
+        override fun onStop() {
+            synchronized(this@ScreenCaptureService) {
+                cleanupCaptureSession()
+                mediaProjection = null
+            }
+        }
+    }
+
     companion object {
         private const val CHANNEL_ID = "screen_capture_channel_id"
         private const val NOTIFICATION_ID = 20389
@@ -122,7 +131,7 @@ class ScreenCaptureService : Service() {
                     val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
                     mediaProjection = try {
                         projectionManager.getMediaProjection(resultCode, data)?.apply {
-                            registerCallback(object : MediaProjection.Callback() {}, Handler(Looper.getMainLooper()))
+                            registerCallback(projectionCallback, Handler(Looper.getMainLooper()))
                         }
                     } catch (e: Exception) {
                         e.printStackTrace()
@@ -221,6 +230,12 @@ class ScreenCaptureService : Service() {
         val mp = synchronized(this@ScreenCaptureService) {
             mediaProjection
         } ?: return@withContext null
+
+        try {
+            mp.registerCallback(projectionCallback, Handler(Looper.getMainLooper()))
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
 
         val deferred = CompletableDeferred<Bitmap?>()
         pendingDeferredBitmap = deferred
