@@ -45,6 +45,13 @@ class ScreenCaptureService : Service() {
     private lateinit var overlayManager: OverlayManager
     private var isProcessingTranslation = false
     private var mediaProjection: MediaProjection? = null
+    private var imageReader: ImageReader? = null
+    private var virtualDisplay: VirtualDisplay? = null
+    private var backgroundThread: HandlerThread? = null
+    private var backgroundHandler: Handler? = null
+
+    @Volatile
+    private var pendingDeferredBitmap: CompletableDeferred<Bitmap?>? = null
 
     companion object {
         private const val CHANNEL_ID = "screen_capture_channel_id"
@@ -151,14 +158,39 @@ class ScreenCaptureService : Service() {
         }
     }
 
-    /**
-     * Grabs a high-fidelity image frame from the MediaProjection.
-     */
-    private suspend fun captureScreen(): Bitmap? = withContext(Dispatchers.Default) {
-        val mp = synchronized(this@ScreenCaptureService) {
+    private fun cleanupCaptureSession() {
+        synchronized(this) {
+            try {
+                virtualDisplay?.release()
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+            virtualDisplay = null
+
+            try {
+                imageReader?.setOnImageAvailableListener(null, null)
+                imageReader?.close()
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+            imageReader = null
+
+            try {
+                backgroundThread?.quit()
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+            backgroundThread = null
+            backgroundHandler = null
+            pendingDeferredBitmap = null
+        }
+    }
+
+    private fun initCaptureSession(width: Int, height: Int, density: Int): Boolean {
+        synchronized(this) {
             if (mediaProjection == null) {
                 val resultCode = MediaProjectionHolder.resultCode
-                val data = MediaProjectionHolder.data ?: return@withContext null
+                val data = MediaProjectionHolder.data ?: return false
                 val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
                 mediaProjection = try {
                     projectionManager.getMediaProjection(resultCode, data)
@@ -167,100 +199,152 @@ class ScreenCaptureService : Service() {
                     null
                 }
             }
-            mediaProjection
-        } ?: return@withContext null
+            val mp = mediaProjection ?: return false
 
+            if (imageReader == null || virtualDisplay == null) {
+                cleanupCaptureSession()
+
+                val ir = try {
+                    ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                    return false
+                }
+                imageReader = ir
+
+                val thread = HandlerThread("ScreenCaptureThread")
+                thread.start()
+                backgroundThread = thread
+                val handler = Handler(thread.looper)
+                backgroundHandler = handler
+
+                val listener = ImageReader.OnImageAvailableListener { reader ->
+                    try {
+                        val image = reader.acquireLatestImage() ?: reader.acquireNextImage()
+                        if (image != null) {
+                            try {
+                                val deferred = pendingDeferredBitmap
+                                if (deferred != null && !deferred.isCompleted) {
+                                    val planes = image.planes
+                                    val buffer = planes[0].buffer
+                                    val pixelStride = planes[0].pixelStride
+                                    val rowStride = planes[0].rowStride
+                                    val rowPadding = rowStride - pixelStride * width
+
+                                    val tempBitmap = Bitmap.createBitmap(
+                                        width + rowPadding / pixelStride,
+                                        height,
+                                        Bitmap.Config.ARGB_8888
+                                    )
+                                    tempBitmap.copyPixelsFromBuffer(buffer)
+
+                                    val croppedBitmap = if (rowPadding != 0) {
+                                        val cb = Bitmap.createBitmap(tempBitmap, 0, 0, width, height)
+                                        if (cb != tempBitmap) {
+                                            tempBitmap.recycle()
+                                        }
+                                        cb
+                                    } else {
+                                        tempBitmap
+                                    }
+                                    pendingDeferredBitmap = null
+                                    deferred.complete(croppedBitmap)
+                                }
+                            } finally {
+                                image.close()
+                            }
+                        }
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                    }
+                }
+
+                ir.setOnImageAvailableListener(listener, handler)
+
+                val vd = try {
+                    mp.createVirtualDisplay(
+                        "ScreenCapture",
+                        width, height, density,
+                        DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                        ir.surface, null, handler
+                    )
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                    ir.close()
+                    thread.quit()
+                    imageReader = null
+                    backgroundThread = null
+                    backgroundHandler = null
+                    return false
+                }
+                virtualDisplay = vd
+            }
+            return true
+        }
+    }
+
+    /**
+     * Grabs a high-fidelity image frame from the MediaProjection.
+     */
+    private suspend fun captureScreen(): Bitmap? = withContext(Dispatchers.Default) {
         val displayMetrics = resources.displayMetrics
         val width = displayMetrics.widthPixels
         val height = displayMetrics.heightPixels
         val density = displayMetrics.densityDpi
 
-        val imageReader = try {
-            ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
-        } catch (e: Exception) {
-            e.printStackTrace()
-            return@withContext null
-        }
+        val initialized = initCaptureSession(width, height, density)
+        if (!initialized) return@withContext null
 
-        val thread = HandlerThread("ScreenCaptureThread")
-        thread.start()
-        val handler = Handler(thread.looper)
+        val deferred = CompletableDeferred<Bitmap?>()
+        pendingDeferredBitmap = deferred
 
-        val deferredBitmap = CompletableDeferred<Bitmap?>()
-
-        val listener = ImageReader.OnImageAvailableListener { r ->
-            try {
-                val image = r.acquireLatestImage() ?: r.acquireNextImage()
-                if (image != null) {
-                    try {
-                        val planes = image.planes
-                        val buffer = planes[0].buffer
-                        val pixelStride = planes[0].pixelStride
-                        val rowStride = planes[0].rowStride
-                        val rowPadding = rowStride - pixelStride * width
-
-                        val tempBitmap = Bitmap.createBitmap(
-                            width + rowPadding / pixelStride,
-                            height,
-                            Bitmap.Config.ARGB_8888
-                        )
-                        tempBitmap.copyPixelsFromBuffer(buffer)
-
-                        val croppedBitmap = if (rowPadding != 0) {
-                            val cb = Bitmap.createBitmap(tempBitmap, 0, 0, width, height)
-                            if (cb != tempBitmap) {
-                                tempBitmap.recycle()
-                            }
-                            cb
-                        } else {
-                            tempBitmap
-                        }
-                        deferredBitmap.complete(croppedBitmap)
-                    } finally {
-                        image.close()
-                    }
-                }
-            } catch (e: Exception) {
-                e.printStackTrace()
-                deferredBitmap.complete(null)
-            }
-        }
-
-        imageReader.setOnImageAvailableListener(listener, handler)
-
-        val virtualDisplay = try {
-            mp.createVirtualDisplay(
-                "ScreenCapture",
-                width, height, density,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                imageReader.surface, null, handler
-            )
-        } catch (e: Exception) {
-            e.printStackTrace()
-            synchronized(this@ScreenCaptureService) {
-                mediaProjection = null
-            }
-            imageReader.close()
-            thread.quit()
-            return@withContext null
-        }
-
+        // Force a capture-related update to kick off drawing if the listener expects it,
+        // but wait for either the onImageAvailable callback or fallback direct buffer read.
         val resultBitmap = try {
-            withTimeout(3000) {
-                deferredBitmap.await()
+            withTimeout(2000) {
+                deferred.await()
             }
         } catch (e: Exception) {
-            e.printStackTrace()
-            null
-        } finally {
+            // Fallback direct acquire
             try {
-                imageReader.setOnImageAvailableListener(null, null)
-                virtualDisplay?.release()
-                imageReader.close()
-                thread.quit()
+                val reader = imageReader
+                if (reader != null) {
+                    val image = reader.acquireLatestImage() ?: reader.acquireNextImage()
+                    if (image != null) {
+                        try {
+                            val planes = image.planes
+                            val buffer = planes[0].buffer
+                            val pixelStride = planes[0].pixelStride
+                            val rowStride = planes[0].rowStride
+                            val rowPadding = rowStride - pixelStride * width
+
+                            val tempBitmap = Bitmap.createBitmap(
+                                width + rowPadding / pixelStride,
+                                height,
+                                Bitmap.Config.ARGB_8888
+                            )
+                            tempBitmap.copyPixelsFromBuffer(buffer)
+
+                            if (rowPadding != 0) {
+                                val cb = Bitmap.createBitmap(tempBitmap, 0, 0, width, height)
+                                if (cb != tempBitmap) {
+                                    tempBitmap.recycle()
+                                }
+                                cb
+                            } else {
+                                tempBitmap
+                            }
+                        } finally {
+                            image.close()
+                        }
+                    } else null
+                } else null
             } catch (ex: Exception) {
                 ex.printStackTrace()
+                null
             }
+        } finally {
+            pendingDeferredBitmap = null
         }
 
         resultBitmap
@@ -303,6 +387,7 @@ class ScreenCaptureService : Service() {
         super.onDestroy()
         ServiceStatus.isRunning.value = false
         serviceScope.cancel()
+        cleanupCaptureSession()
         synchronized(this) {
             try {
                 mediaProjection?.stop()
