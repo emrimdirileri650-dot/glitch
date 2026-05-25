@@ -113,6 +113,23 @@ class ScreenCaptureService : Service() {
             }
         }
 
+        // Initialize MediaProjection immediately to satisfy Android 14+ token validity rules
+        synchronized(this) {
+            if (mediaProjection == null) {
+                val resultCode = MediaProjectionHolder.resultCode
+                val data = MediaProjectionHolder.data
+                if (data != null) {
+                    val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                    mediaProjection = try {
+                        projectionManager.getMediaProjection(resultCode, data)
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                        null
+                    }
+                }
+            }
+        }
+
         // Deploy the on-screen overlays
         overlayManager.showBubble()
 

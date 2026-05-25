@@ -71,8 +71,9 @@ class ServiceViewLifecycleOwner : LifecycleOwner, SavedStateRegistryOwner, ViewM
     private val myViewModelStore = ViewModelStore()
 
     init {
-        lifecycleRegistry.currentState = Lifecycle.State.INITIALIZED
+        savedStateRegistryController.performAttach()
         savedStateRegistryController.performRestore(null)
+        lifecycleRegistry.currentState = Lifecycle.State.INITIALIZED
     }
 
     fun onCreate() {
@@ -188,6 +189,7 @@ class OverlayManager(private val context: Context) {
     fun hideBubble() {
         bubbleView?.let {
             try {
+                it.disposeComposition()
                 windowManager.removeView(it)
                 bubbleLifecycleOwner?.onDestroy()
             } catch (e: Exception) {
@@ -268,6 +270,7 @@ class OverlayManager(private val context: Context) {
     fun hideResultWindow() {
         resultView?.let {
             try {
+                it.disposeComposition()
                 windowManager.removeView(it)
                 resultLifecycleOwner?.onDestroy()
             } catch (e: Exception) {
