@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Screen Translator</string>
+    <string name="accessibility_desc">Reads interactive screen structures to support translation services.</string>
+</resources>

@@ -1,0 +1,6 @@
+{
+  "name": "Screen Translator",
+  "description": "An on-screen translation tool featuring a floating bubble overlay and Gemini AI translations.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
