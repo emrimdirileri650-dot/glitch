@@ -121,7 +121,9 @@ class ScreenCaptureService : Service() {
                 if (data != null) {
                     val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
                     mediaProjection = try {
-                        projectionManager.getMediaProjection(resultCode, data)
+                        projectionManager.getMediaProjection(resultCode, data)?.apply {
+                            registerCallback(object : MediaProjection.Callback() {}, Handler(Looper.getMainLooper()))
+                        }
                     } catch (e: Exception) {
                         e.printStackTrace()
                         null
