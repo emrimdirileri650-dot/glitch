@@ -43,6 +43,9 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.LifecycleRegistry
 import androidx.lifecycle.setViewTreeLifecycleOwner
+import androidx.lifecycle.ViewModelStore
+import androidx.lifecycle.ViewModelStoreOwner
+import androidx.lifecycle.setViewTreeViewModelStoreOwner
 import androidx.savedstate.SavedStateRegistry
 import androidx.savedstate.SavedStateRegistryOwner
 import androidx.savedstate.SavedStateRegistryController
@@ -62,9 +65,10 @@ object OverlayState {
 
 // --- Service Lifecycle & SavedState Provider for Compose View Tree ---
 
-class ServiceViewLifecycleOwner : LifecycleOwner, SavedStateRegistryOwner {
+class ServiceViewLifecycleOwner : LifecycleOwner, SavedStateRegistryOwner, ViewModelStoreOwner {
     private val lifecycleRegistry = LifecycleRegistry(this)
     private val savedStateRegistryController = SavedStateRegistryController.create(this)
+    private val myViewModelStore = ViewModelStore()
 
     init {
         lifecycleRegistry.currentState = Lifecycle.State.INITIALIZED
@@ -82,10 +86,17 @@ class ServiceViewLifecycleOwner : LifecycleOwner, SavedStateRegistryOwner {
 
     fun onDestroy() {
         lifecycleRegistry.currentState = Lifecycle.State.DESTROYED
+        myViewModelStore.clear()
     }
 
-    override val lifecycle: Lifecycle = lifecycleRegistry
-    override val savedStateRegistry: SavedStateRegistry = savedStateRegistryController.savedStateRegistry
+    override val lifecycle: Lifecycle
+        get() = lifecycleRegistry
+
+    override val savedStateRegistry: SavedStateRegistry
+        get() = savedStateRegistryController.savedStateRegistry
+
+    override val viewModelStore: ViewModelStore
+        get() = myViewModelStore
 }
 
 // --- Overlay Manager ---
@@ -141,6 +152,7 @@ class OverlayManager(private val context: Context) {
         bubbleView = ComposeView(context).apply {
             setViewTreeLifecycleOwner(bubbleLifecycleOwner)
             setViewTreeSavedStateRegistryOwner(bubbleLifecycleOwner)
+            setViewTreeViewModelStoreOwner(bubbleLifecycleOwner)
             setContent {
                 MyApplicationTheme {
                     val isLoading by OverlayState.isLoading.collectAsState()
@@ -205,9 +217,13 @@ class OverlayManager(private val context: Context) {
             WindowManager.LayoutParams.TYPE_PHONE
         }
 
+        val density = context.resources.displayMetrics.density
+        val widthPx = (345 * density).toInt()     // standard adaptive width
+        val heightPx = (480 * density).toInt()    // standard adaptive height
+
         val params = WindowManager.LayoutParams(
-            400, // Fixed width
-            550, // Fixed height to provide proper scrolling area
+            widthPx,
+            heightPx,
             overlayType,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
@@ -215,16 +231,10 @@ class OverlayManager(private val context: Context) {
             gravity = Gravity.CENTER
         }
 
-        // On smaller screens, cap width dynamically
-        val displayMetrics = context.resources.displayMetrics
-        val rawWidthPixels = displayMetrics.widthPixels
-        if (rawWidthPixels < params.width) {
-            params.width = (rawWidthPixels * 0.95f).toInt()
-        }
-
         resultView = ComposeView(context).apply {
             setViewTreeLifecycleOwner(resultLifecycleOwner)
             setViewTreeSavedStateRegistryOwner(resultLifecycleOwner)
+            setViewTreeViewModelStoreOwner(resultLifecycleOwner)
             setContent {
                 MyApplicationTheme {
                     val resultText by OverlayState.translationResult.collectAsState()

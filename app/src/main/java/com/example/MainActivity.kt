@@ -105,6 +105,17 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+// --- Context Helper to safely resolve the Activity ---
+
+fun Context.findActivity(): ComponentActivity? {
+    var ctx = this
+    while (ctx is android.content.ContextWrapper) {
+        if (ctx is ComponentActivity) return ctx
+        ctx = ctx.baseContext
+    }
+    return null
+}
+
 // --- Main Composable Dashboard UI ---
 
 @Composable
@@ -114,6 +125,7 @@ fun DashboardScreen(
     stopProjection: () -> Unit
 ) {
     val context = LocalContext.current
+    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
     val scrollState = rememberScrollState()
 
     // Observe service and permission state configurations
@@ -133,15 +145,17 @@ fun DashboardScreen(
     }
 
     // Refresh permission statuses on resume (when user returns from system settings)
-    DisposableEffect(Unit) {
+    DisposableEffect(lifecycleOwner) {
         val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
             if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
                 overlayGranted = PermissionHelper.hasOverlayPermission(context)
                 accessibilityActive = PermissionHelper.isAccessibilityServiceEnabled(context, ScreenTranslatorService::class.java)
             }
         }
-        // (Clean binding hooks)
-        onDispose {}
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
     }
 
     // Regular manual poll configuration during recompositions for immediate feedback
@@ -162,7 +176,10 @@ fun DashboardScreen(
             onToggle = { active ->
                 if (active) {
                     if (!overlayGranted) {
-                        PermissionHelper.requestOverlayPermission(context as MainActivity)
+                        val activity = context.findActivity()
+                        if (activity != null) {
+                            PermissionHelper.requestOverlayPermission(activity)
+                        }
                     } else {
                         requestProjection()
                     }
@@ -182,7 +199,12 @@ fun DashboardScreen(
         PermissionsBlock(
             overlayGranted = overlayGranted,
             accessibilityActive = accessibilityActive,
-            onRequestOverlay = { PermissionHelper.requestOverlayPermission(context as MainActivity) },
+            onRequestOverlay = { 
+                val activity = context.findActivity()
+                if (activity != null) {
+                    PermissionHelper.requestOverlayPermission(activity)
+                }
+            },
             onRequestAccessibility = { PermissionHelper.openAccessibilitySettings(context) }
         )
 

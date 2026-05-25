@@ -40,6 +40,7 @@ class ScreenCaptureService : Service() {
     private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private lateinit var overlayManager: OverlayManager
     private var isProcessingTranslation = false
+    private var mediaProjection: MediaProjection? = null
 
     companion object {
         private const val CHANNEL_ID = "screen_capture_channel_id"
@@ -94,7 +95,11 @@ class ScreenCaptureService : Service() {
         } catch (e: Exception) {
             e.printStackTrace()
             // Fallback starting without projection type if permission isn't fully bound yet
-            startForeground(NOTIFICATION_ID, notification)
+            try {
+                startForeground(NOTIFICATION_ID, notification)
+            } catch (ex: Exception) {
+                ex.printStackTrace()
+            }
         }
 
         // Deploy the on-screen overlays
@@ -146,16 +151,20 @@ class ScreenCaptureService : Service() {
      * Grabs a high-fidelity image frame from the MediaProjection.
      */
     private suspend fun captureScreen(): Bitmap? = withContext(Dispatchers.Default) {
-        val resultCode = MediaProjectionHolder.resultCode
-        val data = MediaProjectionHolder.data ?: return@withContext null
-
-        val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        val mediaProjection = try {
-            projectionManager.getMediaProjection(resultCode, data) ?: return@withContext null
-        } catch (e: Exception) {
-            e.printStackTrace()
-            return@withContext null
-        }
+        val activeProjection = synchronized(this@ScreenCaptureService) {
+            if (mediaProjection == null) {
+                val resultCode = MediaProjectionHolder.resultCode
+                val data = MediaProjectionHolder.data ?: return@withContext null
+                val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                mediaProjection = try {
+                    projectionManager.getMediaProjection(resultCode, data)
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                    null
+                }
+            }
+            mediaProjection
+        } ?: return@withContext null
 
         // Screen parameters setup
         val displayMetrics = resources.displayMetrics
@@ -167,14 +176,14 @@ class ScreenCaptureService : Service() {
         val imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
         
         val virtualDisplay = try {
-            mediaProjection.createVirtualDisplay(
+            activeProjection.createVirtualDisplay(
                 "ScreenCapture",
                 width, height, density,
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
                 imageReader.surface, null, null
             )
         } catch (e: Exception) {
-            mediaProjection.stop()
+            activeProjection.stop()
             imageReader.close()
             return@withContext null
         }
@@ -214,7 +223,6 @@ class ScreenCaptureService : Service() {
             try {
                 virtualDisplay?.release()
                 imageReader.close()
-                mediaProjection.stop()
             } catch (ex: Exception) {
                 ex.printStackTrace()
             }
@@ -259,6 +267,14 @@ class ScreenCaptureService : Service() {
         super.onDestroy()
         ServiceStatus.isRunning.value = false
         serviceScope.cancel()
+        synchronized(this) {
+            try {
+                mediaProjection?.stop()
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+            mediaProjection = null
+        }
         overlayManager.destroy()
     }
 }
